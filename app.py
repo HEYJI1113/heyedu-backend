@@ -1,8 +1,9 @@
 # backend/app.py
 
 import os
+import json
 import sqlite3
-from typing import List, Optional, Dict, Any
+from typing import List, Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -10,160 +11,220 @@ from pydantic import BaseModel
 
 from openai import OpenAI
 
-# ---------- 기본 설정 ----------
-app = FastAPI()
-
-# CORS: 네틀리파이에서 오는 프론트 도메인도 나중에 여기에 추가 가능
-origins = [
-    "*",  # 개발 단계에서는 전체 허용, 배포 후에는 도메인만 허용하는 걸 추천
-]
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# OpenAI 클라이언트
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-
+# ---------- DB 설정 ----------
 DB_PATH = "questions.db"
 
 
-def get_db():
+def get_db_connection():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
 
 
-# ---------- 기존: 문제 리스트 API ----------
-@app.get("/api/questions")
-def get_questions():
-    try:
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute("SELECT * FROM questions")
-        rows = cur.fetchall()
-        conn.close()
+# ---------- FastAPI 앱 ----------
+app = FastAPI()
 
-        questions = [dict(r) for r in rows]
-        return {"questions": questions}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"DB error: {e}")
+# CORS (Netlify / 로컬파일 둘 다 허용)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # 필요하면 나중에 Netlify 도메인만 허용하도록 변경
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ---------- Pydantic 모델 ----------
+
+class QuestionOut(BaseModel):
+    id: int
+    question: str
+    passage: Optional[str] = None
+    choice1: str
+    choice2: str
+    choice3: str
+    choice4: str
+    choice5: str
+    correct_answer: int
+    area: Optional[str] = None
+    qtype: Optional[str] = None
+    difficulty: Optional[str] = None
 
 
-# ---------- 새로 추가: 답안 + LLM 피드백 ----------
-
-class Answer(BaseModel):
-    question_id: int          # 문제 id (DB의 id 컬럼)
-    user_answer: int          # 학생이 고른 번호 (1~5)
-    correct_answer: int       # 정답 번호 (1~5)
+class AnswerItem(BaseModel):
+    # 프론트에서 /submit 으로 보내는 각 문항 정보
+    question_id: int
+    selected: Optional[int] = None          # 0~4, 선택 안 하면 None
+    correct_answer: Optional[int] = None    # 1~5 (엑셀 정답번호 기준)
+    area: Optional[str] = None
+    qtype: Optional[str] = None
+    difficulty: Optional[str] = None
+    user_answer: Optional[str] = None       # 선택한 보기 텍스트, 없을 수도 있음
 
 
 class SubmitRequest(BaseModel):
-    grade: Optional[str] = None     # 중1/중2/중3 등
-    term: Optional[str] = None      # 1학기/2학기
-    textbook: Optional[str] = None  # 동아(윤) 등
-    answers: List[Answer]
+    answers: List[AnswerItem]
 
 
-class FeedbackResponse(BaseModel):
-    feedback_text: str              # LLM이 만들어준 정성적 피드백
-    score_summary: Dict[str, Any]   # 영역/유형별 정량 요약 (간단히)
+class Feedback(BaseModel):
+    summary: str
+    strengths: str
+    weaknesses: str
+    recommendations: str
 
 
-def build_feedback_prompt(payload: SubmitRequest, summary: Dict[str, Any]) -> str:
+class SubmitResponse(BaseModel):
+    score: int
+    total: int
+    feedback: Feedback
+
+
+# ---------- OpenAI 클라이언트 ----------
+client = OpenAI(
+    api_key=os.getenv("OPENAI_API_KEY")
+)
+
+
+# ---------- 엔드포인트 ----------
+
+@app.get("/api/questions", response_model=List[QuestionOut])
+def get_questions():
     """
-    LLM에 넘길 프롬프트 문자열 생성
+    DB에서 모든 문항을 읽어서 프론트로 전달
     """
-    # 학생이 푼 정보 간단 요약
-    meta_lines = []
-    if payload.grade:
-        meta_lines.append(f"- 학년: {payload.grade}")
-    if payload.term:
-        meta_lines.append(f"- 학기: {payload.term}")
-    if payload.textbook:
-        meta_lines.append(f"- 교과서: {payload.textbook}")
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT
+            id,
+            question,
+            passage,
+            choice1,
+            choice2,
+            choice3,
+            choice4,
+            choice5,
+            correct_answer,
+            area,
+            qtype,
+            difficulty
+        FROM questions
+        """
+    )
+    rows = cur.fetchall()
+    conn.close()
 
-    meta_text = "\n".join(meta_lines) if meta_lines else "정보 없음"
-
-    prompt = f"""
-너는 중학생 영어 선생님이야.
-
-학생이 풀었던 중등 영어 학습진단 평가 결과를 바탕으로
-정성적인 피드백을 한국어로 작성해줘.
-
-[학생 정보]
-{meta_text}
-
-[점수 요약]
-- 전체 문항 수: {summary["total"]}문항
-- 정답 개수: {summary["correct"]}문항
-- 오답 개수: {summary["wrong"]}문항
-- 정답률: {summary["accuracy_percent"]:.1f}%
-
-[요청 사항]
-1. 전체적인 학습 수준을 한두 문장으로 요약해줘.
-2. 어휘, 문법, 독해 영역별로 어떤 강점/약점이 있는지 말해줘.
-3. 학생이 다음 학기(또는 다음 단계) 학습을 위해 지금 당장 하면 좋은 공부법을
-   3가지 정도 구체적으로 제안해줘.
-4. 말투는 사려 깊고 응원하는 선생님처럼, 그러나 너무 유치하지 않게.
-
-반드시 3~4개의 단락으로 나눠서 작성해줘.
-"""
-    return prompt.strip()
+    return [QuestionOut(**dict(row)) for row in rows]
 
 
-@app.post("/api/submit", response_model=FeedbackResponse)
+@app.post("/api/submit", response_model=SubmitResponse)
 async def submit_answers(payload: SubmitRequest):
     """
     학생 답안을 받아서:
-    1) 정답/오답 집계 (간단 정량 요약)
-    2) OpenAI LLM을 호출해서 정성적 피드백 생성
+    1) 점수 계산
+    2) OpenAI로 정성적 피드백 생성
     """
-    if not payload.answers:
-        raise HTTPException(status_code=400, detail="answers 목록이 비어 있습니다.")
+    answers = payload.answers
+    total = len(answers)
 
-    # 1. 간단 정량 요약
-    total = len(payload.answers)
-    correct = sum(1 for a in payload.answers if a.user_answer == a.correct_answer)
-    wrong = total - correct
-    accuracy = (correct / total) * 100 if total > 0 else 0.0
+    if total == 0:
+        raise HTTPException(status_code=400, detail="answers 가 비어 있습니다.")
 
-    score_summary = {
-        "total": total,
-        "correct": correct,
-        "wrong": wrong,
-        "accuracy_percent": accuracy,
-    }
+    # --- 1) 점수 계산 ---
+    score = 0
+    result_for_prompt = []  # LLM 프롬프트에 넣을 요약 정보
 
-    # 2. LLM 호출 (에러에 대비한 안전 처리)
-    try:
-        prompt = build_feedback_prompt(payload, score_summary)
+    for a in answers:
+        # 선택/정답이 None 이면 채점에서 제외
+        if a.selected is None or a.correct_answer is None:
+            is_correct = False
+        else:
+            # selected 는 0~4, correct_answer 는 1~5 => +1 해서 비교
+            is_correct = (a.selected + 1) == a.correct_answer
 
-        completion = client.chat.completions.create(
-            model="gpt-4o-mini",  # 필요하면 다른 모델명으로 변경 가능
-            messages=[
-                {
-                    "role": "system",
-                    "content": "You are an expert Korean middle school English teacher.",
-                },
-                {
-                    "role": "user",
-                    "content": prompt,
-                },
-            ],
-            temperature=0.7,
+        if is_correct:
+            score += 1
+
+        result_for_prompt.append(
+            {
+                "question_id": a.question_id,
+                "area": a.area,
+                "qtype": a.qtype,
+                "difficulty": a.difficulty,
+                "selected_index": a.selected,
+                "correct_answer": a.correct_answer,
+                "user_answer": a.user_answer,
+                "is_correct": is_correct,
+            }
         )
 
-        feedback_text = completion.choices[0].message.content.strip()
-    except Exception as e:
-        # API 에러 시, 최소한의 안내 문구라도 돌려주기
-        raise HTTPException(status_code=500, detail=f"LLM 호출 중 오류 발생: {e}")
-
-    return FeedbackResponse(
-        feedback_text=feedback_text,
-        score_summary=score_summary,
+    # --- 2) OpenAI 프롬프트 생성 ---
+    # 필요시 한국어/영어 프롬프트 조정 가능
+    system_msg = (
+        "너는 한국 중학생을 지도하는 영어 교사야. "
+        "학생이 응시한 진단평가 결과를 바탕으로 학습 피드백을 작성해줘. "
+        "반드시 JSON 형식으로만 답해야 한다. "
+        "키는 summary, strengths, weaknesses, recommendations 네 가지여야 한다."
     )
+
+    user_msg = (
+        "다음은 한 학생의 중등 영어 진단평가 결과야.\n\n"
+        f"총 문항 수: {total}문항, 맞힌 문항 수: {score}문항.\n\n"
+        "각 문항의 결과는 다음 JSON 배열이야.\n"
+        "각 항목은 question_id, area(어휘/문법/독해 등), qtype(세부 유형), difficulty(난이도), "
+        "selected_index(학생이 선택한 보기 번호 0~4, 선택 안 한 경우 null), "
+        "correct_answer(정답 번호 1~5), is_correct(정답 여부) 를 포함한다.\n\n"
+        "결과:\n"
+        + json.dumps(result_for_prompt, ensure_ascii=False)
+        + "\n\n"
+        "이 정보를 바탕으로 아래 항목을 모두 한국어로 작성해서 JSON으로 반환해줘.\n"
+        "1) summary: 학생의 전체적인 영어 실력과 이번 진단평가 결과 요약 (3~4문장)\n"
+        "2) strengths: 학생의 강점(잘하는 영역/유형/학습 습관 등)\n"
+        "3) weaknesses: 학생이 어려워한 영역/유형 및 자주 틀린 패턴\n"
+        "4) recommendations: 앞으로 2~3주 동안의 구체적인 학습 전략과 활동 제안\n"
+    )
+
+    try:
+        completion = client.chat.completions.create(
+            model="gpt-4o-mini",
+            temperature=0.2,
+            messages=[
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg},
+            ],
+        )
+        content = completion.choices[0].message.content or ""
+    except Exception as e:
+        # OpenAI 호출 실패 시, 기본 피드백 반환
+        fallback_feedback = Feedback(
+            summary="AI 피드백 생성 중 오류가 발생했습니다. 나중에 다시 시도해 주세요.",
+            strengths="점수와 문항별 정오표를 기반으로 강점을 교사가 직접 분석해 주세요.",
+            weaknesses="점수와 문항별 정오표를 기반으로 약점을 교사가 직접 분석해 주세요.",
+            recommendations="교과서 및 기본 문법/어휘 복습, 틀린 문제 유형 위주로 재학습을 권장합니다.",
+        )
+        return SubmitResponse(score=score, total=total, feedback=fallback_feedback)
+
+    # --- 3) JSON 파싱 + 안전한 fallback ---
+    try:
+        data = json.loads(content)
+        feedback = Feedback(
+            summary=data.get("summary", ""),
+            strengths=data.get("strengths", ""),
+            weaknesses=data.get("weaknesses", ""),
+            recommendations=data.get("recommendations", ""),
+        )
+    except Exception:
+        # 모델이 JSON 형식으로 안 줬을 때 대비
+        feedback = Feedback(
+            summary=content,
+            strengths="",
+            weaknesses="",
+            recommendations="",
+        )
+
+    return SubmitResponse(score=score, total=total, feedback=feedback)
+
+
+@app.get("/")
+def root():
+    return {"status": "ok", "message": "HeyEdu backend running"}
